@@ -52,6 +52,9 @@ private:
 	std::shared_ptr<std::unordered_set<std::string>> _disabled_plugins =
 		std::make_shared<std::unordered_set<std::string>> ();
 
+	/* The set of available checkers. */
+	std::vector<Checker*> _checkers;
+
 protected:
 	/* Note: This is called before ParseArgs, and must transfer ownership
 	 * of the ASTConsumer. The TartanAction object is destroyed immediately
@@ -69,22 +72,12 @@ protected:
 			new GAssertAttributesConsumer ());
 
 		/* Checkers. */
-		consumers.push_back (
-			new NullabilityConsumer (compiler,
-			                         this->_gir_manager,
-			                         this->_disabled_plugins));
-		consumers.push_back (
-			new GVariantConsumer (compiler,
-			                      this->_gir_manager,
-			                      this->_disabled_plugins));
-		consumers.push_back (
-			new GSignalConsumer (compiler,
-			                     this->_gir_manager,
-			                     this->_disabled_plugins));
-		consumers.push_back (
-			new GirAttributesChecker (compiler,
-			                          this->_gir_manager,
-			                          this->_disabled_plugins));
+		this->_ensure_checkers (compiler);
+
+		for (std::vector<Checker*>::const_iterator it = this->_checkers.begin ();
+		    it != this->_checkers.end (); ++it) {
+			consumers.push_back (*it);
+		}
 
 		return new MultiplexConsumer (consumers);
 	}
@@ -189,6 +182,53 @@ private:
 		return true;
 	}
 
+	void
+	_ensure_checkers (CompilerInstance &compiler)
+	{
+		if (!this->_checkers.empty ()) {
+			return;
+		}
+
+		/* Set up all the checkers. */
+		this->_checkers.push_back (
+			new NullabilityConsumer (compiler,
+			                         this->_gir_manager,
+			                         this->_disabled_plugins));
+		this->_checkers.push_back (
+			new GVariantConsumer (compiler,
+			                      this->_gir_manager,
+			                      this->_disabled_plugins));
+		this->_checkers.push_back (
+			new GSignalConsumer (compiler,
+			                     this->_gir_manager,
+			                     this->_disabled_plugins));
+		this->_checkers.push_back (
+			new GirAttributesChecker (compiler,
+			                          this->_gir_manager,
+			                          this->_disabled_plugins));
+	}
+
+	void
+	_print_checkers (llvm::raw_ostream &out)
+	{
+		this->_ensure_checkers (this->getCompilerInstance ());
+
+		out << "Available checkers:\n";
+		bool has_printed = false;
+
+		for (std::vector<Checker*>::const_iterator it = this->_checkers.begin ();
+		    it != this->_checkers.end (); ++it) {
+			const Checker *c = *it;
+
+			out << "    " << c->get_name () << "\n";
+			has_printed = true;
+		}
+
+		if (!has_printed) {
+			out << "    (None.)\n";
+		}
+	}
+
 protected:
 	/* Parse command line arguments for the plugin. Note: This is called
 	 * after CreateASTConsumer. */
@@ -206,6 +246,8 @@ protected:
 
 			if (arg == "--help") {
 				this->PrintHelp (llvm::errs ());
+			} else if (arg == "--list-checkers") {
+				this->_print_checkers (llvm::errs ());
 			} else if (arg == "--enable-checker") {
 				const std::string checker = *(++it);
 				if (checker == "all") {
