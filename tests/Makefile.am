@@ -16,6 +16,7 @@ c_tests = \
 	gvariant-lookup.c \
 	gvariant-new.c \
 	nonnull.c \
+	refcount-gobject-intra.c \
 	$(NULL)
 
 templates = \
@@ -29,6 +30,8 @@ templates = \
 	gsignal.tail.c \
 	gvariant.head.c \
 	gvariant.tail.c \
+	refcount-intra.head.c \
+	refcount-intra.tail.c \
 	$(NULL)
 
 TESTS = $(c_tests)
