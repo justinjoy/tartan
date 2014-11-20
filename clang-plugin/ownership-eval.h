@@ -20,50 +20,42 @@
  *     Philip Withnall <philip.withnall@collabora.co.uk>
  */
 
-#ifndef TARTAN_CHECKER_H
-#define TARTAN_CHECKER_H
-
-#include <unordered_set>
+#ifndef TARTAN_OWNERSHIP_EVAL_H
+#define TARTAN_OWNERSHIP_EVAL_H
 
 #include <clang/AST/AST.h>
-#include <clang/AST/ASTConsumer.h>
-#include <clang/Frontend/CompilerInstance.h>
+#include <clang/StaticAnalyzer/Core/Checker.h>
+#include <clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h>
+#include <clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h>
 
-#include <girepository.h>
-
+#include "checker.h"
 #include "gir-manager.h"
 
 namespace tartan {
 
 using namespace clang;
+using namespace ento;
 
-extern std::shared_ptr<GirManager> global_gir_manager;
-
-class Checker {
+class OwnershipEval : public ento::Checker<eval::Call>,
+                      public tartan::Checker {
 public:
-	virtual const std::string get_name () const = 0;
-};
-
-class ASTChecker : public tartan::Checker,
-                   public clang::ASTConsumer {
-
-public:
-	explicit ASTChecker (
-		CompilerInstance& compiler,
-		std::shared_ptr<const GirManager> gir_manager,
-		std::shared_ptr<const std::unordered_set<std::string>> disabled_plugins) :
-		_compiler (compiler), _gir_manager (gir_manager),
-		_disabled_plugins (disabled_plugins) {}
+	explicit OwnershipEval () : _gir_manager (global_gir_manager) {};
 
 protected:
-	CompilerInstance& _compiler;
 	std::shared_ptr<const GirManager> _gir_manager;
-	std::shared_ptr<const std::unordered_set<std::string>> _disabled_plugins;
+
+private:
+	ProgramStateRef _evaluate_gir_call (CheckerContext &context,
+	                                    const CallExpr &call_expr,
+	                                    const GIFunctionInfo &info) const;
 
 public:
-	bool is_enabled () const;
+	bool evalCall (const CallExpr *call,
+	               CheckerContext &context) const;
+
+	const std::string get_name () const { return "ownership"; }
 };
 
 } /* namespace tartan */
 
-#endif /* !TARTAN_CHECKER_H */
+#endif /* !TARTAN_OWNERSHIP_EVAL_H */

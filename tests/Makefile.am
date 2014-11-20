@@ -6,18 +6,7 @@ TEST_EXTENSIONS = .c
 C_LOG_COMPILER = $(top_srcdir)/tests/wrapper-compiler-errors
 
 c_tests = \
-	assertion-extraction.c \
-	assertion-extraction-return.c \
-	gsignal-connect.c \
-	gvariant-builder.c \
-	gvariant-get.c \
-	gvariant-get-child.c \
-	gvariant-iter.c \
-	gvariant-lookup.c \
-	gvariant-new.c \
-	non-glib.c \
-	nonnull.c \
-	gerror-api.c \
+	ownership.c \
 	$(NULL)
 
 templates = \

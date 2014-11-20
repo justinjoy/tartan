@@ -1,7 +1,7 @@
 /* -*- Mode: C++; indent-tabs-mode: t; c-basic-offset: 8; tab-width: 8 -*- */
 /*
  * Tartan
- * Copyright © 2013 Collabora Ltd.
+ * Copyright © 2013, 2014 Collabora Ltd.
  *
  * Tartan is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -77,6 +77,8 @@ _function_return_type_is_const (FunctionDecl& func)
 #else /* if !HAVE_LLVM_3_5 */
 	QualType type = func.getResultType ();
 #endif /* !HAVE_LLVM_3_5 */
+
+	type = type.getDesugaredType (func.getASTContext ());
 
 	const PointerType* pointer_type = dyn_cast<PointerType> (type);
 	if (pointer_type == NULL)
@@ -172,6 +174,333 @@ _ignore_glib_internal_func (const std::string func_name)
 	return false;
 }
 
+/* TODO: DOcs */
+typedef struct AllocatorInfo {
+	/* Identifier for the allocator and free functions, e.g. malloc() and
+	 * free(). */
+	const IdentifierInfo *allocator_identifier;
+	const IdentifierInfo *free_identifier;
+
+	/* Whether the allocator supports reference counting semantics. */
+	bool supports_ref_counting;
+
+	/* Whether the allocator supports instantly dropping all references for
+	 * an allocation. */
+	bool supports_free;
+
+	AllocatorInfo () : allocator_identifier (NULL), free_identifier (NULL),
+	                   supports_ref_counting (false),
+	                   supports_free (false) {};
+	AllocatorInfo (const IdentifierInfo *aid, const IdentifierInfo *fid,
+	               bool src,
+	               bool sf) : allocator_identifier (aid),
+	                          free_identifier (fid),
+	                          supports_ref_counting (src),
+	                          supports_free (sf) {};
+} AllocatorInfo;
+
+/* Return a dummy AllocatorInfo for an unknown, non-allocated or unsupported
+ * type. Return a useful AllocatorInfo containing the IdentifierInfo of the
+ * allocator function associated with the type otherwise.
+ *
+ * Note that currently only types allocated using malloc() (which we consider
+ * equivalent to g_malloc() and friends) are supported at the moment. */
+static AllocatorInfo
+_type_to_allocator_info (GITypeInfo type_info, GITypeTag type_tag,
+                         const std::string &func_name,
+                         const ASTContext &ast_context)
+{
+	switch (type_tag) {
+	case GI_TYPE_TAG_VOID:
+	case GI_TYPE_TAG_BOOLEAN:
+	case GI_TYPE_TAG_INT8:
+	case GI_TYPE_TAG_UINT8:
+	case GI_TYPE_TAG_INT16:
+	case GI_TYPE_TAG_UINT16:
+	case GI_TYPE_TAG_INT32:
+	case GI_TYPE_TAG_UINT32:
+	case GI_TYPE_TAG_INT64:
+	case GI_TYPE_TAG_UINT64:
+	case GI_TYPE_TAG_FLOAT:
+	case GI_TYPE_TAG_DOUBLE:
+	case GI_TYPE_TAG_UNICHAR:
+		/* Non-allocated types. */
+		return AllocatorInfo ();
+	case GI_TYPE_TAG_GTYPE:
+		/* Unsupported types. */
+		return AllocatorInfo ();
+	case GI_TYPE_TAG_UTF8:
+	case GI_TYPE_TAG_FILENAME:
+		/* Supported types. */
+		return AllocatorInfo (&ast_context.Idents.get ("g_malloc"),
+		                      &ast_context.Idents.get ("g_free"),
+		                      false, true);
+	case GI_TYPE_TAG_ARRAY:
+		return AllocatorInfo (&ast_context.Idents.get ("g_ptr_array_new_full"),
+		                      &ast_context.Idents.get ("g_ptr_array_unref"),
+		                      true, true);
+	case GI_TYPE_TAG_INTERFACE:
+		return AllocatorInfo (&ast_context.Idents.get ("g_object_ref"),
+		                      &ast_context.Idents.get ("g_object_unref"),
+		                      true, false);
+	case GI_TYPE_TAG_GLIST:
+		return AllocatorInfo (&ast_context.Idents.get ("g_list_alloc"),
+		                      &ast_context.Idents.get ("g_list_free_1"),
+		                      false, true);
+	case GI_TYPE_TAG_GSLIST:
+		return AllocatorInfo (&ast_context.Idents.get ("g_slist_alloc"),
+		                      &ast_context.Idents.get ("g_slist_free_1"),
+		                      false, true);
+	case GI_TYPE_TAG_GHASH:
+		return AllocatorInfo (&ast_context.Idents.get ("g_hash_table_new_full"),
+		                      &ast_context.Idents.get ("g_hash_table_unref"),
+		                      true, true);
+	case GI_TYPE_TAG_ERROR:
+		return AllocatorInfo (&ast_context.Idents.get ("g_error_new"),
+		                      &ast_context.Idents.get ("g_error_free"),
+		                      false, true);
+	default:
+		WARN ("Error: Unhandled GI type tag " << type_tag <<
+		      " in introspection info for function ‘" <<
+		      func_name << "’.");
+		return AllocatorInfo ();
+	}
+}
+
+typedef struct {
+	const gchar *func_name;
+
+	bool ownership_returns;
+	int ownership_returns_arg;
+
+	int ownership_takes_arg;
+	int ownership_holds_arg;
+} NonGirInfo;
+
+static const NonGirInfo _non_gir_info[] = {
+	/* g_new(), g_new0(), g_renew(), g_try_new(), g_try_new0(),
+	 * g_try_renew() are all macros. */
+	/* malloc()-like functions: */
+	{ "g_malloc", true, 0, -1, -1 },
+	{ "g_malloc0", true, 0, -1, -1 },
+	{ "g_try_malloc", true, 0, -1, -1 },
+	{ "g_try_malloc0", true, 0, -1, -1 },
+	/* calloc()-like function:
+	 * FIXME: Add support for calloc()-like ownership_returns upstream. */
+	{ "g_malloc_n", true, -1, -1, -1 },
+	{ "g_malloc0_n", true, -1, -1, -1 },
+	{ "g_try_malloc_n", true, -1, -1, -1 },
+	{ "g_try_malloc0_n", true, -1, -1, -1 },
+	/* realloc()-like functions: */
+	{ "g_realloc", true, 1, 0, -1 },
+	{ "g_try_realloc", true, 1, 0, -1 },
+	{ "g_realloc_n", true, -1, 0, -1 },
+	{ "g_try_realloc_n", true, -1, 0, -1 },
+	/* free()-like functions: */
+	{ "g_free", false, -1, 0, -1 },
+	/* GObject ref-counting functions: */
+	{ "g_object_ref", true, -1, -1, -1 },
+	{ "g_object_unref", false, -1, 0, -1 },
+
+	/* FIXME: Can’t support g_clear_pointer(), g_memdup(), g_clear_object(),
+	 * floating references, weak references, toggle references. */
+};
+
+/* Return a NonGirInfo structure for this @decl if it’s a memory allocation
+ * function which is non-introspectable. Return %NULL otherwise. */
+static const NonGirInfo *
+_is_non_gir_function (const FunctionDecl &decl)
+{
+	guint i;
+	const std::string func_name = decl.getNameAsString ();
+
+	for (i = 0; i < G_N_ELEMENTS (_non_gir_info); i++) {
+		const NonGirInfo *info = &_non_gir_info[i];
+
+		if (info->func_name == func_name) {
+			return info;
+		}
+	}
+
+	return NULL;
+}
+
+/* There are various memory management functions which are not exposed in GIR,
+ * but which are vital for correct memory management. Manually add attributes to
+ * them.
+ *
+ * FIXME: This is not ideal. They should somehow be exposed from the typelib.
+ *
+ * TODO: What about constructors? Seem to be unrepresented here. */
+static void
+_non_gir_func_process_ownership (FunctionDecl &decl,
+                                 const NonGirInfo *info)
+{
+	/* Sanity check. */
+	assert (!(info->ownership_takes_arg >= 0 &&
+	          info->ownership_holds_arg >= 0 &&
+	          info->ownership_takes_arg == info->ownership_holds_arg));
+
+	/* FIXME: See earlier comment about having to use malloc(). */
+	ASTContext &ast_context = decl.getASTContext ();
+	IdentifierInfo &malloc_info = ast_context.Idents.get ("malloc");
+
+	/* ownership_returns. */
+	if (info->ownership_returns && info->ownership_returns_arg >= 0) {
+		unsigned int arg = info->ownership_returns_arg;
+		decl.addAttr (::new (ast_context)
+		              OwnershipAttr (decl.getSourceRange (),
+		                             ast_context, &malloc_info, &arg, 1,
+		                             OwnershipAttr::Returns));
+	} else if (info->ownership_returns) {
+		decl.addAttr (::new (ast_context)
+		              OwnershipAttr (decl.getSourceRange (),
+		                             ast_context, &malloc_info, NULL, 0,
+		                             OwnershipAttr::Returns));
+	}
+
+	/* ownership_holds. */
+	if (info->ownership_holds_arg >= 0) {
+		unsigned int arg = info->ownership_holds_arg;
+		decl.addAttr (::new (ast_context)
+		              OwnershipAttr (decl.getSourceRange (),
+		                             ast_context, &malloc_info, &arg, 1,
+		                             OwnershipAttr::Holds));
+	}
+
+	/* ownership_takes. */
+	if (info->ownership_holds_arg >= 0) {
+		unsigned int arg = info->ownership_takes_arg;
+		decl.addAttr (::new (ast_context)
+		              OwnershipAttr (decl.getSourceRange (),
+		                             ast_context, &malloc_info, &arg, 1,
+		                             OwnershipAttr::Holds));
+	}
+}
+
+/* TODO:
+ * What to do about container-vs-everything?
+ * Propagate ownership attributes through functions
+ *
+ * TODO later:
+ * Check for conflicts with existing ownership attributes
+ */
+static OwnershipAttr *
+_arg_process_ownership (GIArgInfo arg, GITypeInfo type_info,
+                        GITransfer transfer, GIDirection direction,
+                        GITypeTag type_tag, const std::string &func_name,
+                        SourceRange source_range, unsigned int arg_index,
+                        ASTContext &ast_context)
+{
+	/* Check the transfer type. */
+	switch (transfer) {
+	case GI_TRANSFER_NOTHING:
+		/* No ownership attribute needed. */
+		return NULL;
+	case GI_TRANSFER_CONTAINER:
+	case GI_TRANSFER_EVERYTHING:
+		/* Cannot currently differentiate between these. Both are
+		 * supported. */
+		break;
+	default:
+		WARN ("Error: Unhandled GI transfer " << transfer << " in "
+		      "introspection info for function ‘" << func_name << "’.");
+		return NULL;
+	}
+
+	/* Check the direction. */
+	switch (direction) {
+	case GI_DIRECTION_IN:
+	case GI_DIRECTION_INOUT:
+		/* These are supported. */
+		break;
+	case GI_DIRECTION_OUT:
+		/* ownership_returns doesn’t support out-parameters. */
+		return NULL;
+	default:
+		WARN ("Error: Unhandled GI direction " << direction << " in "
+		      "introspection info for function ‘" << func_name << "’.");
+		return NULL;
+	}
+
+	/* Grab the allocator info. */
+	const AllocatorInfo allocator_info =
+		_type_to_allocator_info (type_info, type_tag, func_name,
+		                         ast_context);
+
+	/* If the argument is suitable, create an OwnershipAttr for it. */
+	int attr_spelling_index = -1;  /* no attribute */
+	bool temp = true;  /* TODO */
+
+	if (allocator_info.supports_ref_counting &&
+	    !allocator_info.supports_free) {
+		attr_spelling_index = OwnershipAttr::Holds;
+	} else if (!allocator_info.supports_ref_counting &&
+	           allocator_info.supports_free) {
+		attr_spelling_index = OwnershipAttr::Takes;
+	} else if (allocator_info.supports_ref_counting &&
+	           allocator_info.supports_free) {
+		attr_spelling_index =
+			temp ? OwnershipAttr::Holds : OwnershipAttr::Takes;
+	}
+
+	/* FIXME: The MallocChecker is only good for malloc() functions at the
+	 * moment. So use malloc() as the identifier for everything so that we
+	 * get some warnings rather than none. In future, use
+	 * allocator_info.allocator_identifier instead, so we can pair
+	 * alloc/free functions as well. */
+	IdentifierInfo &malloc_info = ast_context.Idents.get ("malloc");
+
+	if (attr_spelling_index != -1) {
+		return ::new (ast_context)
+		       OwnershipAttr (source_range, ast_context, &malloc_info,
+		                      &arg_index, 1, attr_spelling_index);
+	}
+
+	return NULL;
+}
+
+/* TODO: Docs */
+static OwnershipAttr *
+_return_process_ownership (GITypeInfo type_info, GITransfer transfer,
+                           GITypeTag type_tag, const std::string &func_name,
+                           SourceRange source_range, ASTContext &ast_context)
+{
+	/* Check the transfer type. */
+	switch (transfer) {
+	case GI_TRANSFER_NOTHING:
+		/* No ownership attribute needed. */
+		return NULL;
+	case GI_TRANSFER_CONTAINER:
+	case GI_TRANSFER_EVERYTHING:
+		/* Cannot currently differentiate between these. Both are
+		 * supported. */
+		break;
+	default:
+		WARN ("Error: Unhandled GI transfer " << transfer << " in "
+		      "introspection info for function ‘" << func_name << "’.");
+		return NULL;
+	}
+
+	/* Grab the allocator info. */
+	const AllocatorInfo allocator_info =
+		_type_to_allocator_info (type_info, type_tag, func_name,
+		                         ast_context);
+
+	/* If the argument is suitable, create an OwnershipAttr for it. */
+	if (allocator_info.supports_ref_counting ||
+	    allocator_info.supports_free) {
+		/* FIXME: See earlier comment about having to use malloc(). */
+		IdentifierInfo &malloc_info = ast_context.Idents.get ("malloc");
+
+		return ::new (ast_context)
+		       OwnershipAttr (source_range, ast_context, &malloc_info,
+		                      NULL, 0, OwnershipAttr::Returns);
+	}
+
+	return NULL;
+}
+
 void
 GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 {
@@ -186,8 +515,16 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 	const std::string func_name = func.getNameAsString ();  /* TODO: expensive? */
 	GIBaseInfo *info = this->_gir_manager.get ()->find_function_info (func_name);
 
-	if (info == NULL)
+	if (info == NULL) {
+		/* Is the function a non-introspectable allocation function? */
+		const NonGirInfo *_info = _is_non_gir_function (func);
+
+		if (_info != NULL) {
+			_non_gir_func_process_ownership (func, _info);
+		}
+
 		return;
+	}
 
 	/* Extract information from the GIBaseInfo and add AST attributes
 	 * accordingly. */
@@ -198,12 +535,15 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 		/* GError formal parameters aren’t included in the number of
 		 * callable arguments. */
 		unsigned int k = g_callable_info_get_n_args (callable_info);
+		unsigned int self_params =
+			(g_function_info_get_flags (callable_info) &
+			 GI_FUNCTION_IS_METHOD) ? 1 : 0;
 		unsigned int err_params =
 			(g_function_info_get_flags (callable_info) &
 			 GI_FUNCTION_THROWS) ? 1 : 0;
 
 		/* Sanity check. */
-		if (k + err_params != func.getNumParams ()) {
+		if (k + self_params + err_params != func.getNumParams ()) {
 			WARN ("Number of GIR callable parameters (" << k << ") "
 			      "differs from number of C formal parameters (" <<
 			      func.getNumParams () << "). Ignoring function " <<
@@ -223,15 +563,18 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 			                      nonnull_attr->args_end ());
 		}
 
-		for (j = 0; j < k; j++) {
+		for (j = self_params; j < k + self_params; j++) {
 			GIArgInfo arg;
 			GITypeInfo type_info;
 			GITransfer transfer;
+			GIDirection direction;
 			GITypeTag type_tag;
 
-			g_callable_info_load_arg (callable_info, j, &arg);
+			g_callable_info_load_arg (callable_info,
+			                          j - self_params, &arg);
 			g_arg_info_load_type (&arg, &type_info);
 			transfer = g_arg_info_get_ownership_transfer (&arg);
+			direction = g_arg_info_get_direction (&arg);
 			type_tag = g_type_info_get_tag (&type_info);
 
 			int array_type =
@@ -242,8 +585,7 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 			DEBUG ("GirAttributes: " << func_name << "(" << j <<
 			       ")\n"
 			       "\tTransfer: " << transfer << "\n"
-			       "\tDirection: " <<
-			       g_arg_info_get_direction (&arg) << "\n"
+			       "\tDirection: " << direction << "\n"
 			       "\tNullable: " <<
 			       g_arg_info_may_be_null (&arg) << "\n"
 			       "\tOptional: " <<
@@ -251,8 +593,7 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 			       "\tIs pointer: " <<
 			       g_type_info_is_pointer (&type_info) << "\n"
 			       "\tType tag: " <<
-			       g_type_tag_to_string (
-			           g_type_info_get_tag (&type_info)) << "\n"
+			       g_type_tag_to_string (type_tag) << "\n"
 			       "\tArray type: " <<
 			       array_type << "\n"
 			       "\tArray length: " <<
@@ -263,6 +604,23 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 			if (_arg_is_nonnull (arg, type_info)) {
 				DEBUG ("Got nonnull arg " << j << " from GIR.");
 				non_null_args.push_back (j);
+			}
+
+			/* Ownership. */
+			OwnershipAttr *ownership_attr;
+
+			ownership_attr = _arg_process_ownership (arg,
+			                                         type_info,
+			                                         transfer,
+			                                         direction,
+			                                         type_tag,
+			                                         func_name,
+			                                         func.getSourceRange (),
+			                                         j,
+			                                         func.getASTContext ());
+
+			if (ownership_attr != NULL) {
+				func.addAttr (ownership_attr);
 			}
 
 			if (_type_should_be_const (transfer, type_tag)) {
@@ -321,6 +679,18 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 			_constify_function_return_type (func);
 		}
 
+		/* ownership_returns. */
+		OwnershipAttr *ownership_attr =
+			_return_process_ownership (return_type_info,
+			                           return_transfer,
+			                           return_type_tag, func_name,
+			                           func.getSourceRange (),
+			                           func.getASTContext ());
+
+		if (ownership_attr != NULL) {
+			func.addAttr (ownership_attr);
+		}
+
 		/* Mark the function as deprecated if it wasn’t already. The
 		 * typelib file doesn’t contain a deprecation message, version,
 		 * or replacement function so we can’t make use of them. */
@@ -361,6 +731,7 @@ GirAttributesConsumer::_handle_function_decl (FunctionDecl& func)
 				            func.getASTContext ());
 #endif /* !HAVE_LLVM_3_5 */
 			func.addAttr (malloc_attr);
+			/* TODO: Add ownership attribute too. */
 		}
 
 		break;
@@ -440,12 +811,15 @@ GirAttributesChecker::_handle_function_decl (FunctionDecl& func)
 		/* GError formal parameters aren’t included in the number of
 		 * callable arguments. */
 		unsigned int k = g_callable_info_get_n_args (callable_info);
+		unsigned int self_params =
+			(g_function_info_get_flags (callable_info) &
+			 GI_FUNCTION_IS_METHOD) ? 1 : 0;
 		unsigned int err_params =
 			(g_function_info_get_flags (callable_info) &
 			 GI_FUNCTION_THROWS) ? 1 : 0;
 
 		/* Sanity check. */
-		if (k + err_params != func.getNumParams ()) {
+		if (k + self_params + err_params != func.getNumParams ()) {
 			WARN ("Number of GIR callable parameters (" << k << ") "
 			      "differs from number of C formal parameters (" <<
 			      func.getNumParams () << "). Ignoring function " <<
