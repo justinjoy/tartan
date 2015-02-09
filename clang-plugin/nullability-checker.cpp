@@ -82,6 +82,65 @@ NullabilityConsumer::HandleTranslationUnit (ASTContext& context)
 	this->_visitor.TraverseDecl (context.getTranslationUnitDecl ());
 }
 
+static bool
+arg_is_closure (GIArgInfo arg, GITypeInfo type_info)
+{
+	return (g_arg_info_get_closure (&arg) != -1 ||
+	        g_arg_info_get_destroy (&arg) != -1 ||
+	        g_arg_info_get_scope (&arg) != GI_SCOPE_TYPE_INVALID);
+}
+
+static bool
+arg_is_cancellable (GIArgInfo arg, GITypeInfo type_info)
+{
+	bool retval;
+
+	if (g_type_info_get_tag (&type_info) != GI_TYPE_TAG_INTERFACE) {
+		return FALSE;
+	}
+
+	GIBaseInfo *iface = g_type_info_get_interface (&type_info);
+
+	retval = (g_base_info_get_type (iface) == GI_INFO_TYPE_OBJECT &&
+	          strcmp (g_base_info_get_name (iface), "Cancellable") == 0 &&
+	          strcmp (g_base_info_get_namespace (iface), "Gio") == 0);
+
+	g_base_info_unref (iface);
+
+	return retval;
+}
+
+static bool
+arg_is_async_ready_callback (GIArgInfo arg, GITypeInfo type_info)
+{
+	bool retval;
+
+	if (g_type_info_get_tag (&type_info) != GI_TYPE_TAG_INTERFACE) {
+		return FALSE;
+	}
+
+	GIBaseInfo *iface = g_type_info_get_interface (&type_info);
+
+	retval = (g_base_info_get_type (iface) == GI_INFO_TYPE_CALLBACK &&
+	          strcmp (g_base_info_get_name (iface), "AsyncReadyCallback") == 0 &&
+	          strcmp (g_base_info_get_namespace (iface), "Gio") == 0);
+
+	g_base_info_unref (iface);
+
+	return retval;
+}
+
+static bool
+arg_may_be_null (GIArgInfo arg, GITypeInfo type_info)
+{
+	return (g_arg_info_may_be_null (&arg) ||
+	        g_arg_info_is_optional (&arg) ||
+	        arg_is_closure (arg, type_info) ||
+	        (g_arg_info_get_direction (&arg) != GI_DIRECTION_OUT &&
+	         (arg_is_cancellable (arg, type_info) ||
+	          arg_is_async_ready_callback (arg, type_info))));
+}
+
 /* Note: Specifically overriding the Traverse* method here to re-implement
  * recursion to child nodes. */
 bool
@@ -171,20 +230,34 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 
 	GICallableInfo *callable_info = (GICallableInfo *) info;
 
+	/* GError formal parameters aren’t included in the number of
+	 * callable arguments. */
+	unsigned int k = g_callable_info_get_n_args (callable_info);
+	unsigned int err_params =
+		(g_function_info_get_flags (callable_info) &
+		 GI_FUNCTION_THROWS) ? 1 : 0;
+	unsigned int obj_params =
+		(g_base_info_get_container (info) != NULL &&
+		 g_function_info_get_flags (callable_info) &
+		 GI_FUNCTION_IS_METHOD) ? 1 : 0;
+	unsigned int j;
+
 	/* Handle the parameters. */
-	for (FunctionDecl::param_const_iterator it = func->param_begin (),
-	     ie = func->param_end (); it != ie; ++it) {
-		ParmVarDecl* parm_decl = *it;
-		unsigned int idx = parm_decl->getFunctionScopeIndex ();
+	for (j = 0; j < k; j++) {
 		GIArgInfo arg;
 		GITypeInfo type_info;
+		GITransfer transfer;
+		GITypeTag type_tag;
+		ParmVarDecl *parm = func->getParamDecl (obj_params + j);
+
+		g_callable_info_load_arg (callable_info, j, &arg);
+		g_arg_info_load_type (&arg, &type_info);
+		transfer = g_arg_info_get_ownership_transfer (&arg);
+		type_tag = g_type_info_get_tag (&type_info);
 
 		/* Skip non-pointer arguments. */
-		if (!parm_decl->getType ()->isPointerType ())
+		if (!parm->getType ()->isPointerType ())
 			continue;
-
-		g_callable_info_load_arg (callable_info, idx, &arg);
-		g_arg_info_load_type (&arg, &type_info);
 
 		enum {
 			EXPLICIT_NULLABLE,  /* 0 */
@@ -192,11 +265,10 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 			EXPLICIT_NONNULL,  /* 1 */
 		} has_nonnull =
 			(nonnull_attr == NULL) ? MAYBE :
-			(nonnull_attr->isNonNull (idx)) ?
+			(nonnull_attr->isNonNull (obj_params + j)) ?
 				EXPLICIT_NONNULL: EXPLICIT_NULLABLE;
-		bool has_nullable = (g_arg_info_may_be_null (&arg) ||
-		                     g_arg_info_is_optional (&arg));
-		bool has_assertion = (asserted_parms.count (parm_decl) > 0);
+		bool has_nullable = arg_may_be_null (arg, type_info);
+		bool has_assertion = (asserted_parms.count (parm) > 0);
 
 		/* Analysis:
 		 *
@@ -236,8 +308,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 				"annotation on the ‘%0’ parameter "
 				"of function %1().",
 				this->_compiler,
-				parm_decl->getLocStart ())
-			<< parm_decl->getNameAsString ()
+				parm->getLocStart ())
+			<< parm->getNameAsString ()
 			<< func->getNameAsString ();
 		} else if (has_nullable && has_assertion) {
 			Debug::emit_error (
@@ -246,8 +318,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 				"non-NULL precondition assertion on the ‘%0’ "
 				"parameter of function %1().",
 				this->_compiler,
-				parm_decl->getLocStart ())
-			<< parm_decl->getNameAsString ()
+				parm->getLocStart ())
+			<< parm->getNameAsString ()
 			<< func->getNameAsString ();
 		} else if (!has_nullable && !has_assertion) {
 			switch (has_nonnull) {
@@ -259,8 +331,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 					"(already has a nonnull attribute or "
 					"no non-NULL precondition assertion).",
 					this->_compiler,
-					parm_decl->getLocStart ())
-				<< parm_decl->getNameAsString ()
+					parm->getLocStart ())
+				<< parm->getNameAsString ()
 				<< func->getNameAsString ();
 				break;
 			case MAYBE:
@@ -270,8 +342,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 					"non-NULL precondition assertion on "
 					"the ‘%0’ parameter of function %1().",
 					this->_compiler,
-					parm_decl->getLocStart ())
-				<< parm_decl->getNameAsString ()
+					parm->getLocStart ())
+				<< parm->getNameAsString ()
 				<< func->getNameAsString ();
 				break;
 			case EXPLICIT_NONNULL:
@@ -283,8 +355,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 					"(optional) or (allow-none) "
 					"annotation).",
 					this->_compiler,
-					parm_decl->getLocStart ())
-				<< parm_decl->getNameAsString ()
+					parm->getLocStart ())
+				<< parm->getNameAsString ()
 				<< func->getNameAsString ();
 				break;
 			}
@@ -294,8 +366,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 				"non-NULL precondition annotation on the ‘%0’ "
 				"parameter of function %1().",
 				this->_compiler,
-				parm_decl->getLocStart ())
-			<< parm_decl->getNameAsString ()
+				parm->getLocStart ())
+			<< parm->getNameAsString ()
 			<< func->getNameAsString ();
 		} else if (has_nonnull == MAYBE && has_assertion) {
 			/* TODO: Make this a soft warning (disabled by default)
@@ -305,8 +377,8 @@ NullabilityVisitor::TraverseFunctionDecl (FunctionDecl* func)
 				"parameter of function %1() (already has a "
 				"non-NULL precondition assertion).",
 				this->_compiler,
-				parm_decl->getLocStart ())
-			<< parm_decl->getNameAsString ()
+				parm->getLocStart ())
+			<< parm->getNameAsString ()
 			<< func->getNameAsString ();
 		}
 	}

@@ -5,6 +5,7 @@
 TEST_EXTENSIONS = .c
 C_LOG_COMPILER = $(top_srcdir)/tests/wrapper-compiler-errors
 
+# c_tests are split up and have templates attached; simple_c_tests are not.
 c_tests = \
 	assertion-extraction.c \
 	assertion-extraction-return.c \
@@ -18,6 +19,12 @@ c_tests = \
 	non-glib.c \
 	nonnull.c \
 	gerror-api.c \
+	$(NULL)
+simple_c_tests = \
+	annotations.simple.c \
+	$(NULL)
+test_typelibs = \
+	Test-1.0.typelib \
 	$(NULL)
 
 templates = \
@@ -37,11 +44,20 @@ templates = \
 	gvariant.tail.c \
 	$(NULL)
 
-TESTS = $(c_tests)
+TESTS = $(c_tests) $(simple_c_tests)
 EXTRA_DIST = \
 	$(templates) \
 	$(c_tests) \
+	$(simple_c_tests) \
 	wrapper-compiler-errors \
 	$(NULL)
+
+# Test GIR file and typelib which we can load.
+%.typelib: %.gir
+	$(AM_V_GEN) $(G_IR_COMPILER) --includedir=. $< -o $@
+
+EXTRA_DIST += Test-1.0.gir
+BUILT_SOURCES = $(test_typelibs)
+CLEANFILES = $(test_typelibs)
 
 -include $(top_srcdir)/git.mk

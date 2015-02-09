@@ -221,7 +221,8 @@ private:
 
 				std::string _typelib_filename (typelib_filename);
 				std::string::size_type last_dot = _typelib_filename.find_last_of (".");
-				if (last_dot == std::string::npos) {
+				if (last_dot == std::string::npos ||
+				    _typelib_filename.substr (last_dot) != ".typelib") {
 					/* No ‘.typelib’ suffix — ignore. */
 					continue;
 				}
@@ -243,6 +244,18 @@ protected:
 	ParseArgs (const CompilerInstance &CI,
 	           const std::vector<std::string>& args)
 	{
+		/* Check for additional GI paths. */
+		for (std::vector<std::string>::const_iterator it = args.begin();
+		     it != args.end (); ++it) {
+			std::string arg = *it;
+
+			if (arg == "--gi-path") {
+				const std::string path = *(++it);
+
+				g_irepository_prepend_search_path (path.c_str ());
+			}
+		}
+
 		/* Load all typelibs. */
 		this->_load_gi_repositories (CI);
 
@@ -321,6 +334,8 @@ protected:
 		       "        Disable the given Tartan checker, which may be "
 		               "‘all’. All checkers are\n"
 		       "        enabled by default.\n"
+		       "    --gi-path [path]\n"
+		       "        Add an additional typelib search path.\n"
 		       "    --quiet\n"
 		       "        Disable all plugin output except code "
 		               "diagnostics (remarks,\n"

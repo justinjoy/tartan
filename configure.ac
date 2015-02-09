@@ -104,6 +104,12 @@ AC_CHECK_HEADER([clang/AST/Expr.h],[],[
 CPPFLAGS="$old_cppflags"
 AC_LANG_POP([C++])
 
+# g-ir-compiler for unit tests
+AC_PATH_PROG([G_IR_COMPILER],[g-ir-compiler])
+AS_IF([test "$G_IR_COMPILER" == ""],[
+	AC_MSG_ERROR([g-ir-compiler not found])
+])
+
 # Internationalisation
 GETTEXT_PACKAGE=AC_PACKAGE_NAME
 AC_SUBST([GETTEXT_PACKAGE])

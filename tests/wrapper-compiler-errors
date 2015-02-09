@@ -25,6 +25,7 @@ temp_dir=`mktemp -d`
 tests_dir=`dirname $0`
 tartan=${tests_dir}/../scripts/tartan
 tartan_plugin=${tests_dir}/../clang-plugin/.libs/libtartan.so
+simple_extension="${input_filename:(-9)}"
 
 echo "Reading input from ${input_filename}."
 echo "Using temporary directory ${temp_dir}."
@@ -38,21 +39,27 @@ test_status=0
 system_includes=`echo | cpp -Wp,-v 2>&1 | grep '^[[:space:]]' | \
 	sed -e 's/^[[:space:]]*/-isystem/' | tr "\n" ' '`
 
-# Extract the template name.
-template_name=`head -n 1 "${input_filename}" | \
-	sed -n 's/\/\*[[:space:]]*Template:\(.*\)\*\//\1/p' | \
-	tr -d ' '`
+if [[ $simple_extension != ".simple.c" ]]; then
+	# Extract the template name.
+	template_name=`head -n 1 "${input_filename}" | \
+		sed -n 's/\/\*[[:space:]]*Template:\(.*\)\*\//\1/p' | \
+		tr -d ' '`
 
-echo "Using template ${template_name}."
+	echo "Using template ${template_name}."
 
-# Split the input file up into sections, delimiting on ‘/*’ on a line by itself.
-tail -n +3 "${input_filename}" > "${temp_dir}/${input_filename}.tail"
-csplit --keep-files --elide-empty-files --silent \
-	--prefix="${temp_dir}/${input_filename}_" \
-	--suffix-format='%02d.c' \
-	"${temp_dir}/${input_filename}.tail" '/^\/\*/' '{*}'
+	# Split the input file up into sections, delimiting on ‘/*’ on a line by itself.
+	tail -n +3 "${input_filename}" > "${temp_dir}/${input_filename}.tail"
+	csplit --keep-files --elide-empty-files --silent \
+		--prefix="${temp_dir}/${input_filename}_" \
+		--suffix-format='%02d.c' \
+		"${temp_dir}/${input_filename}.tail" '/^\/\*/' '{*}'
 
-echo ""
+	echo ""
+else
+	# Don’t split simple input files up.
+	echo "Copying file unmodified."
+	cp "${input_filename}" "${temp_dir}/${input_filename}_00.c"
+fi
 
 num=0
 while [[ -f `printf "${temp_dir}/${input_filename}_%02d.c" ${num}` ]]; do
@@ -66,12 +73,14 @@ while [[ -f `printf "${temp_dir}/${input_filename}_%02d.c" ${num}` ]]; do
 	echo " - Building section file ${section_filename}."
 	echo " - Outputting to error files ${expected_error_filename} and ${actual_error_filename}."
 
-	# Wrap the section’s code with a prefix and suffix.
-	(cat "${template_name}.head.c"
-	 cat "${section_filename}"
-	 cat "${template_name}.tail.c"
-	) > $section_filename.tmp
-	mv -f $section_filename.tmp $section_filename
+	if [[ $simple_extension != ".simple.c" ]]; then
+		# Wrap the section’s code with a prefix and suffix.
+		(cat "${template_name}.head.c"
+		 cat "${section_filename}"
+		 cat "${template_name}.tail.c"
+		) > $section_filename.tmp
+		mv -f $section_filename.tmp $section_filename
+	fi
 
 	num=$((num + 1))
 
@@ -91,7 +100,7 @@ while [[ -f `printf "${temp_dir}/${input_filename}_%02d.c" ${num}` ]]; do
 	# TARTAN_TEST_OPTIONS="-analyzer-checker=debug.ViewExplodedGraph" to
 	# debug the ExplodedGraph
 	TARTAN_PLUGIN=$tartan_plugin \
-	TARTAN_OPTIONS=--quiet \
+	TARTAN_OPTIONS="--quiet --gi-path ." \
 	$tartan \
 		-cc1 -analyze -std=c89 -Wno-visibility $TARTAN_TEST_OPTIONS \
 		`pkg-config --cflags glib-2.0` \
